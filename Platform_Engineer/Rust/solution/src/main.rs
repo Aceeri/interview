@@ -10,13 +10,15 @@ pub struct Config {
 }
 
 impl IntoFormat for Config {
-    fn serialize<'a, 'b>(&'b self, mut serializer: Serializer<'a>) -> Serializer<'a> {
-        let mut struct_ser = serializer.reuse();
+    fn serialize<'a, 'b>(&'b self, serializer: &'a mut Serializer<'a>) {
+        let taken = std::mem::take(serializer); // `Vec::new` does not allocate, so we temporarily take this
+        let mut struct_ser = taken.reuse(); // change the lifetime on buffers
+
         struct_ser.write_int(self.data);
         struct_ser.write_string(self.name.as_str());
         struct_ser.write_bool(self.cool);
-        serializer = struct_ser.reuse();
-        serializer
+
+        *serializer = struct_ser.reuse(); // return the lifetime
     }
 
     fn deserialize(data: &[u8], deserializer: &mut Deserializer) -> Self {
@@ -39,5 +41,5 @@ fn main() {
         cool: true,
     };
 
-    let serializer = config.serialize(serializer);
+    config.serialize(&mut serializer);
 }

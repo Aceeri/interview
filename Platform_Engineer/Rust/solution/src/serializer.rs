@@ -1,5 +1,6 @@
 use crate::bit_packer::BitPacker;
 
+#[derive(Default)]
 pub struct Serializer<'a> {
     // each property is order-dependent, arrays are flattened into this structure and theoretically
     // nested structs would do the same.
@@ -28,7 +29,8 @@ pub struct Serializer<'a> {
     booleans: Vec<bool>,
 }
 
-// funny ownership hack into making the compiler re-use the allocated Vec
+// get the compiler to re-use the allocated Vec
+// worst case the optimization fails and we end up with the naive allocating solution.
 fn reuse_vec<T, U>(mut v: Vec<T>) -> Vec<U> {
     const {
         assert!(size_of::<T>() == size_of::<U>());
@@ -133,7 +135,6 @@ impl Deserializer {
 }
 
 pub trait IntoFormat {
-    #[must_use]
-    fn serialize<'a, 'b>(&'b self, serializer: Serializer<'a>) -> Serializer<'a>;
+    fn serialize<'a, 'b>(&'b self, serializer: &'a mut Serializer<'a>);
     fn deserialize(data: &[u8], deserializer: &mut Deserializer) -> Self;
 }

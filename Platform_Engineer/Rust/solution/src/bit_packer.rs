@@ -1,3 +1,12 @@
+use std::borrow::Cow;
+
+use crate::serializer::PropertyType;
+
+/// 3 bit header for the length of the integer
+/// Biased towards smaller numbers, since numbers greater than 2^32 seem like they'd be fairly uncommon
+/// in configurations.
+const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
+
 pub struct BitPacker<'a> {
     pub buffer: &'a mut Vec<u8>,
     pub bit_offset: u8,
@@ -13,18 +22,46 @@ impl<'a> BitPacker<'a> {
         }
     }
 
-    pub fn write_bytes(&mut self, mut bytes: impl Iterator<Item = u8>) {
-        if self.bit_offset == 0 {
-            if let Some(first) = bytes.next() {
-                let last = self.buffer.len() - 1;
-                self.buffer[last] = first;
-                self.buffer.extend(bytes);
-                self.bit_offset = 8;
+    pub fn write_bytes_width(&mut self, bytes: &[u8], width: u8) {
+        assert!(width > 0);
+
+        let total_bytes = (width as usize + 7) / 8;
+        let remaining_bits = width % 8;
+
+        if remaining_bits > 0 {
+            self.write_bits(bytes[total_bytes - 1], remaining_bits);
+            for i in (0..total_bytes - 1).rev() {
+                self.write_byte(bytes[i]);
             }
-        } else if self.bit_offset == 8 {
-            self.buffer.extend(bytes);
         } else {
-            for byte in bytes {
+            for i in (0..total_bytes).rev() {
+                self.write_byte(bytes[i]);
+            }
+        }
+    }
+
+    pub fn write_byte(&mut self, byte: u8) {
+        self.write_bytes(&[byte]);
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+
+        // TODO: do we even need the 0 and 8 bit stuff? feels a bit silly
+        if self.bit_offset == 0 {
+            // placeholder byte exists, fill it first
+            let last = self.buffer.len() - 1;
+            self.buffer[last] = bytes[0];
+            self.buffer.extend_from_slice(&bytes[1..]);
+            self.bit_offset = 8;
+        } else if self.bit_offset == 8 {
+            // last byte filled, just extend
+            self.buffer.extend_from_slice(bytes);
+        } else {
+            // disjoint, fill last and next
+            for &byte in bytes {
                 let left_mask = byte >> self.bit_offset;
                 let right_mask = byte << (8 - self.bit_offset);
                 let last = self.buffer.len() - 1;
@@ -35,9 +72,7 @@ impl<'a> BitPacker<'a> {
     }
 
     pub fn write_bits(&mut self, bits: u8, width: u8) {
-        if width == 0 {
-            return;
-        }
+        assert!(width > 0);
 
         if self.bit_offset == 8 {
             self.buffer.push(0);
@@ -59,12 +94,6 @@ impl<'a> BitPacker<'a> {
         }
     }
 
-    pub fn write_bits_u32(&mut self, bits: u32, width: u8) {
-        for i in (0..width).rev() {
-            self.write_bit((bits >> i) & 1 != 0);
-        }
-    }
-
     pub fn write_bit(&mut self, bit: bool) {
         if self.bit_offset == 8 {
             self.buffer.push(0);
@@ -80,42 +109,25 @@ impl<'a> BitPacker<'a> {
     }
 
     pub fn write_int(&mut self, int: i64) {
-        let (header, length) = if int < i8::MAX as i64 {
-            (0b00, 1)
-        } else if int < i16::MAX as i64 {
-            (0b01, 2)
-        } else if int < i32::MAX as i64 {
-            (0b10, 4)
-        } else {
-            (0b11, 8)
-        };
+        let header = INT_WIDTHS
+            .iter()
+            .position(|&width| int < (1i64 << width))
+            .unwrap_or(7);
+        let width = INT_WIDTHS[header];
 
-        self.write_bits(header, 2);
-        self.write_bytes(int.to_le_bytes().into_iter().take(length));
+        self.write_bits(header as u8, 3);
+        self.write_bytes_width(&int.to_le_bytes(), width);
     }
 
-    pub fn write_strings(&mut self, strings: &[&str]) {
-        use crate::huffman::{HuffmanTable, compress};
-
-        let mut blob = Vec::new();
-        for (i, s) in strings.iter().enumerate() {
-            if i > 0 {
-                blob.push(0);
-            }
-            blob.extend_from_slice(s.as_bytes());
-        }
-
-        let table = HuffmanTable::common_table();
-        let compressed = compress(&blob, &table);
-
-        self.write_int(strings.len() as i64);
-        self.write_int(blob.len() as i64);
-        self.write_int(compressed.len() as i64);
-        self.write_bytes(compressed.into_iter());
+    pub fn write_string(&mut self, strings: &Cow<str>) {
+        const NULL_TERMINATOR: u8 = 0;
+        self.write_bytes(strings.as_bytes());
+        self.write_byte(NULL_TERMINATOR)
     }
 
-    pub fn finish(self) -> Vec<u8> {
-        self.buffer.clone()
+    pub fn write_property_type(&mut self, tag: PropertyType) {
+        let (bits, len) = tag.to_bits();
+        self.write_bits(bits, len);
     }
 }
 
@@ -134,24 +146,22 @@ impl<'a> BitUnpacker<'a> {
         }
     }
 
-    pub fn read_bit(&mut self) -> bool {
-        let byte = self.buffer[self.byte_index];
+    pub fn read_bit(&mut self) -> Option<bool> {
+        let byte = self.buffer.get(self.byte_index)?;
         let bit = (byte >> (7 - self.bit_offset)) & 1 != 0;
         self.bit_offset += 1;
         if self.bit_offset == 8 {
             self.byte_index += 1;
             self.bit_offset = 0;
         }
-        bit
+        Some(bit)
     }
 
-    pub fn read_bits(&mut self, width: u8) -> u8 {
-        if width == 0 {
-            return 0;
-        }
+    pub fn read_bits(&mut self, width: u8) -> Option<u8> {
+        assert!(width > 0);
 
         let remaining = 8 - self.bit_offset;
-        let byte = self.buffer[self.byte_index];
+        let byte = self.buffer.get(self.byte_index)?;
 
         if width <= remaining {
             let shift = remaining - width;
@@ -162,121 +172,72 @@ impl<'a> BitUnpacker<'a> {
                 self.byte_index += 1;
                 self.bit_offset = 0;
             }
-            result
+            Some(result)
         } else {
             let first_mask = ((1u16 << remaining) - 1) as u8;
             let first_part = byte & first_mask;
             self.byte_index += 1;
 
             let second_width = width - remaining;
-            let second_byte = self.buffer[self.byte_index];
+            let second_byte = self.buffer.get(self.byte_index)?;
             let second_part = second_byte >> (8 - second_width);
 
             self.bit_offset = second_width;
-            (first_part << second_width) | second_part
+            Some((first_part << second_width) | second_part)
         }
     }
 
-    pub fn peek_bits(&self, width: u8) -> usize {
-        let mut result = 0usize;
-        let mut byte_pos = self.byte_index;
-        let mut bit_pos = self.bit_offset;
-
-        for _ in 0..width {
-            if byte_pos >= self.buffer.len() {
-                result <<= 1;
-            } else {
-                let bit = ((self.buffer[byte_pos] >> (7 - bit_pos)) & 1) as usize;
-                result = (result << 1) | bit;
-                bit_pos += 1;
-                if bit_pos == 8 {
-                    byte_pos += 1;
-                    bit_pos = 0;
-                }
-            }
-        }
-        result
-    }
-
-    pub fn skip_bits(&mut self, n: u8) {
-        self.bit_offset += n;
-        while self.bit_offset >= 8 {
-            self.byte_index += 1;
-            self.bit_offset -= 8;
-        }
-    }
-
-    pub fn read_bytes(&mut self, n: usize) -> Vec<u8> {
+    pub fn read_bytes(&mut self, n: usize) -> Option<Vec<u8>> {
         let mut result = Vec::with_capacity(n);
         for _ in 0..n {
-            result.push(self.read_byte());
+            result.push(self.read_byte()?);
         }
-        result
+        Some(result)
     }
 
-    pub fn read_byte(&mut self) -> u8 {
+    pub fn read_byte(&mut self) -> Option<u8> {
         if self.bit_offset == 0 {
-            let byte = self.buffer[self.byte_index];
+            let byte = self.buffer.get(self.byte_index)?;
             self.byte_index += 1;
-            byte
+            Some(*byte)
         } else {
             let remaining = 8 - self.bit_offset;
-            let first_part = self.buffer[self.byte_index] & (((1u16 << remaining) - 1) as u8);
+            let first_part = self.buffer.get(self.byte_index)? & (((1u16 << remaining) - 1) as u8);
             self.byte_index += 1;
-            let second_part = self.buffer[self.byte_index] >> remaining;
-            (first_part << self.bit_offset) | second_part
+            let second_part = self.buffer.get(self.byte_index)? >> remaining;
+            Some((first_part << self.bit_offset) | second_part)
         }
     }
 
-    pub fn read_int(&mut self) -> i64 {
-        let header = self.read_bits(2);
-        let length = match header {
-            0b00 => 1,
-            0b01 => 2,
-            0b10 => 4,
-            0b11 => 8,
-            _ => unreachable!(),
-        };
+    pub fn read_int(&mut self) -> Option<i64> {
+        let header = self.read_bits(3)?;
+        let width = INT_WIDTHS[header as usize];
 
-        // 3 bit header?
-        /*
-        0 => 4,
-        1 => 6,
-        2 => 8,
-        3 => 12,
-        4 => 16,
-        5 => 24,
-        6 => 32,
-        7 => 64,
-        */
-
-        let mut bytes = [0u8; 8];
-        for i in 0..length {
-            bytes[i] = self.read_byte();
+        let mut value: u64 = 0;
+        for _ in 0..width {
+            value = (value << 1) | (self.read_bit()? as u64);
         }
-        i64::from_le_bytes(bytes)
+        Some(value as i64)
     }
 
-    pub fn read_strings(&mut self) -> Vec<String> {
-        use crate::huffman::{HuffmanTable, decompress};
+    pub fn read_string(&mut self) -> Option<String> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = self.read_byte()?;
+            if byte == 0 {
+                break;
+            }
 
-        let count = self.read_int() as usize;
-        let blob_len = self.read_int() as usize;
-        let compressed_len = self.read_int() as usize;
-        let compressed = (0..compressed_len)
-            .map(|_| self.read_byte())
-            .collect::<Vec<_>>();
-
-        let table = HuffmanTable::common_table();
-        let blob = decompress(&compressed, blob_len, &table);
-
-        if count == 0 {
-            return Vec::new();
+            bytes.push(byte);
         }
 
-        blob.split(|&b| b == 0)
-            .map(|s| String::from_utf8_lossy(s).into_owned())
-            .collect()
+        // from_utf8_lossy_owned would be cool
+        Some(String::from_utf8_lossy(bytes.as_slice()).into_owned())
+    }
+
+    pub fn read_property_type(&mut self) -> Option<PropertyType> {
+        let bits = self.read_bits(2)?;
+        PropertyType::from_bits(bits)
     }
 }
 
@@ -310,10 +271,10 @@ mod tests {
         let mut buffer = Vec::new();
         let mut packer = BitPacker::new(&mut buffer);
 
-        packer.write_bytes([0b11111001].into_iter());
+        packer.write_bytes(&[0b11111001]);
         assert_eq!(*packer.buffer, vec![0b11111001]);
 
-        packer.write_bytes([0b00000000].into_iter());
+        packer.write_bytes(&[0b00000000]);
         assert_eq!(*packer.buffer, vec![0b11111001, 0b00000000]);
     }
 
@@ -322,17 +283,17 @@ mod tests {
         let buffer = vec![0b11110000, 0b10101010];
         let mut unpacker = BitUnpacker::new(&buffer);
 
-        assert_eq!(unpacker.read_bit(), true);
-        assert_eq!(unpacker.read_bit(), true);
-        assert_eq!(unpacker.read_bit(), true);
-        assert_eq!(unpacker.read_bit(), true);
-        assert_eq!(unpacker.read_bit(), false);
-        assert_eq!(unpacker.read_bit(), false);
-        assert_eq!(unpacker.read_bit(), false);
-        assert_eq!(unpacker.read_bit(), false);
+        assert_eq!(unpacker.read_bit(), Some(true));
+        assert_eq!(unpacker.read_bit(), Some(true));
+        assert_eq!(unpacker.read_bit(), Some(true));
+        assert_eq!(unpacker.read_bit(), Some(true));
+        assert_eq!(unpacker.read_bit(), Some(false));
+        assert_eq!(unpacker.read_bit(), Some(false));
+        assert_eq!(unpacker.read_bit(), Some(false));
+        assert_eq!(unpacker.read_bit(), Some(false));
 
-        assert_eq!(unpacker.read_bits(4), 0b1010);
-        assert_eq!(unpacker.read_bits(4), 0b1010);
+        assert_eq!(unpacker.read_bits(4), Some(0b1010));
+        assert_eq!(unpacker.read_bits(4), Some(0b1010));
     }
 
     #[test]
@@ -340,8 +301,8 @@ mod tests {
         let buffer = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let mut unpacker = BitUnpacker::new(&buffer);
 
-        assert_eq!(unpacker.read_bytes(2), vec![0xDE, 0xAD]);
-        assert_eq!(unpacker.read_bytes(2), vec![0xBE, 0xEF]);
+        assert_eq!(unpacker.read_bytes(2), Some(vec![0xDE, 0xAD]));
+        assert_eq!(unpacker.read_bytes(2), Some(vec![0xBE, 0xEF]));
     }
 
     #[test]
@@ -352,13 +313,13 @@ mod tests {
         packer.write_bits(0b101, 3);
         packer.write_bits(0b11110000, 8);
         packer.write_bit(true);
-        packer.write_bytes([0xAB, 0xCD].into_iter());
+        packer.write_bytes(&[0xAB, 0xCD]);
 
         let mut unpacker = BitUnpacker::new(&buffer);
-        assert_eq!(unpacker.read_bits(3), 0b101);
-        assert_eq!(unpacker.read_bits(8), 0b11110000);
-        assert_eq!(unpacker.read_bit(), true);
-        assert_eq!(unpacker.read_bytes(2), vec![0xAB, 0xCD]);
+        assert_eq!(unpacker.read_bits(3), Some(0b101));
+        assert_eq!(unpacker.read_bits(8), Some(0b11110000));
+        assert_eq!(unpacker.read_bit(), Some(true));
+        assert_eq!(unpacker.read_bytes(2), Some(vec![0xAB, 0xCD]));
     }
 
     #[test]
@@ -371,8 +332,8 @@ mod tests {
         packer.write_int(100000);
 
         let mut unpacker = BitUnpacker::new(&buffer);
-        assert_eq!(unpacker.read_int(), 42);
-        assert_eq!(unpacker.read_int(), 1000);
-        assert_eq!(unpacker.read_int(), 100000);
+        assert_eq!(unpacker.read_int(), Some(42));
+        assert_eq!(unpacker.read_int(), Some(1000));
+        assert_eq!(unpacker.read_int(), Some(100000));
     }
 }

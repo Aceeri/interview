@@ -1,6 +1,8 @@
-use crate::bit_packer::BitPacker;
+use std::collections::VecDeque;
 
-#[derive(Default)]
+use crate::bit_packer::{BitPacker, BitUnpacker};
+
+#[derive(Debug, Default)]
 pub struct Serializer<'a> {
     // each property is order-dependent, arrays are flattened into this structure and theoretically
     // nested structs would do the same.
@@ -81,60 +83,90 @@ impl<'a> Serializer<'a> {
     pub fn finish(&self, buffer: &mut Vec<u8>) {
         let mut packer = BitPacker::new(buffer);
 
-        /*
+        packer.write_int(self.integers.len() as i64);
+        packer.write_int(self.booleans.len() as i64);
+
         for integer in &self.integers {
-            // header
-            let bytes = if *integer < i8::MAX as i64 {
-                1
-            } else if *integer < i16::MAX as i64 {
-                2
-            } else if *integer < i32::MAX as i64 {
-                3
-            } else {
-                4
-            };
-            packer.write_bytes(*integer);
+            packer.write_int(*integer);
         }
 
         for boolean in &self.booleans {
-            // simple bitset
             packer.write_bit(*boolean);
         }
 
-        for string in &self.strings {
-            packer.write_bytes(string.bytes());
-            packer.write_bytes(std::iter::once(0)); // null terminated
-        }
-        */
+        // Batch compress all strings together
+        packer.write_strings(&self.strings);
+
+        let native = self.native_bytes();
+        let buffer = buffer.len();
+        eprintln!(
+            "buffer: {:?}, native: {:?}, compression: {:?}",
+            buffer,
+            native,
+            buffer as f32 / native as f32
+        );
+    }
+
+    pub fn native_bytes(&self) -> usize {
+        std::mem::size_of::<bool>() * self.booleans.len()
+            + std::mem::size_of::<i64>() * self.integers.len()
+            + self.strings.iter().map(|s| s.len()).sum::<usize>()
     }
 }
 
+#[derive(Debug)]
 pub struct Deserializer {
-    integer_index: usize,
-    string_index: usize,
-    boolean_index: usize,
-
     // buffers
-    integers: Vec<i64>,
-    strings: Vec<String>,
-    booleans: Vec<bool>,
+    integers: VecDeque<i64>,
+    strings: VecDeque<String>,
+    booleans: VecDeque<bool>,
 }
 
 impl Deserializer {
     pub fn new() -> Self {
         Self {
-            integer_index: 0,
-            string_index: 0,
-            boolean_index: 0,
-
-            integers: Vec::new(),
-            strings: Vec::new(),
-            booleans: Vec::new(),
+            integers: Default::default(),
+            strings: Default::default(),
+            booleans: Default::default(),
         }
+    }
+
+    pub fn read_bytes(&mut self, bytes: &[u8]) {
+        let mut unpacker = BitUnpacker::new(bytes);
+
+        let int_len = unpacker.read_int();
+        let bool_len = unpacker.read_int();
+
+        for _ in 0..int_len {
+            self.integers.push_back(unpacker.read_int());
+        }
+
+        for _ in 0..bool_len {
+            self.booleans.push_back(unpacker.read_bit());
+        }
+
+        // Read batch-compressed strings
+        for s in unpacker.read_strings() {
+            self.strings.push_back(s);
+        }
+    }
+
+    pub fn take_int(&mut self) -> Option<i64> {
+        self.integers.pop_front()
+    }
+
+    pub fn take_bool(&mut self) -> Option<bool> {
+        self.booleans.pop_front()
+    }
+
+    pub fn take_string(&mut self) -> Option<String> {
+        self.strings.pop_front()
     }
 }
 
 pub trait IntoFormat {
-    fn serialize<'a, 'b>(&'b self, serializer: &'a mut Serializer<'a>);
-    fn deserialize(data: &[u8], deserializer: &mut Deserializer) -> Self;
+    fn serialize<'a>(&'a self, serializer: &mut Serializer<'a>);
+    fn deserialize(data: &[u8], deserializer: &mut Deserializer) -> Option<Self>
+    where
+        Self: Sized;
 }

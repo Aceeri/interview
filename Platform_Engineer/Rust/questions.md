@@ -9,10 +9,11 @@ of clear tests for:
 - Making sure the boundaries between types are defined and never run over. This is mainly an issue with the dynamically sized types.
 - Keeping the dynamic types like strings at the end of the format and maybe use a sentinel EOF value as a runtime safeguard.
 
-A lot of this compactness also depends heavily on ordering of fields. It makes sense to have a
+A lot of this compactness also depends heavily on ordering of fields. It'd make sense to have a
 hash at the start of the message to verify the schema matching up before we deserialize. Or alternatively
 setting up a CI test per config struct to verify the schema matches up with the previously written one
-minus suffixed additions (with some ways to "force" your way out)
+minus suffixed additions (with some ways to "force" your way out). I left it out for the sake of 
+compactness, but in practice I'd keep it because it'd reduce a lot of headaches.
 
 2. What if you wanted to make the schema self-describing. How would you change your implementation?
 Mainly I'd think about just adding a header to the beginning, the main thing that is implied is the ordering of the properties and then property naming.
@@ -41,7 +42,7 @@ is probably as far as I'd go for balancing speed and compactness.
 
 If we could force some assumptions about string length, we could also remove any chance of allocations during deserialization.
 
-I'd also assume that unpacking integers into words would be faster.
+I'd also assume that unpacking integers into words would be faster. SIMD unpacking would be good too, but that's assuming you have a good bit of integers/strings/etc. plus SIMD is rarely easy to maintain (maybe once we get portable-simd in stable...).
 
 Would need to profile all of this, most assumptions usually have to get thrown out of the window constantly when dealing with this small of data changes.
 
@@ -59,6 +60,6 @@ Would we need to migrate a lot of existing metadata? Or is this all more transit
 
 If we don't need to migrate, then I'd just have a suggestion of keeping the more size bounded data near the front and the unbounded data near the end. If we *do* need migrations then I'd just append the new type at the end of the format and things should work the same.
 
-I'd still suggest keeping the new types together, it enables much better compression + it should lead to better compression if thrown through something like zstd/
+I'd still suggest keeping data of types together, it enables much better compression internally & it should lead to better compression if thrown through something like zstd/lzf/whichever since it's effectively doing something like BWT preprocessing.
 
 Nesting could largely be handled the same way the arrays are currently handled: flattening the structure down to their properties.

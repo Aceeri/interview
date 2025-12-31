@@ -3,14 +3,14 @@ use std::{borrow::Cow, collections::VecDeque, marker::PhantomData};
 use crate::bit_packer::{BitPacker, BitUnpacker};
 
 // Assumptions/requirements about schemas:
-// - Support small configs primarily, but scale ok to larger ones if needed.
-// - Strings are largely english & alphanumeric, but full unicode should still be supported.
+// - Primarily focus on small configs, but scale ok to larger ones if needed.
 // - Source of data is verified outside of serializing/deserializing, but invalid properties should still
 //   be caught in case of any form of data corruption.
 // - Versioning of schemas is handled by the user/tooling.
 // - Schemas are compressed after serialization via mature libraries such as zstd/lz4, preprocessing and
-//   entropy encoding are left out of the format to prevent interference with these more mature libraries,
+//   entropy encoding is left out of the format to prevent interference with these more mature libraries,
 //   instead focus mainly on reducing the amount of pointless entropy in our data.
+
 #[derive(Debug, Default)]
 pub struct Serializer<'a, S: IntoFormat> {
     // each property is order-dependent, arrays are flattened into this structure and theoretically
@@ -28,7 +28,7 @@ pub struct Serializer<'a, S: IntoFormat> {
     // is really worth it since then your header is likely largely than the data itself, but I could be wrong.
     //
     // delta encoding?
-    // daniel lemire's FastPFOR or similar would be worthwhile if we weren't expecting small amounts of properties.
+    // daniel lemire's FastPFOR or similar would be worthwhile if we were expecting larger amounts of integers.
     integers: Vec<i64>,
     // UTF-8 is fairly compact already, just write that to the buffer. Delta encoding might be the worthwhile here
     // too for compression assuming its mostly alphanumeric.
@@ -89,7 +89,7 @@ pub enum PropertyValue {
     Array(Vec<PropertyValue>),
 }
 
-// get the compiler to re-use the allocated Vec
+// hacky way to get the compiler to re-use the allocated Vec for differing lifetimes
 // worst case the optimization fails and we end up with the naive allocating solution.
 fn reuse_vec<T, U>(mut v: Vec<T>) -> Vec<U> {
     const {
@@ -111,14 +111,7 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.integers.clear();
-        self.strings.clear();
-        self.booleans.clear();
-        self.property_types.clear();
-    }
-
-    // for buffer re-use
+    // should generally hint to the compiler enough that we can re-use this serializer.
     pub fn reuse<'b>(mut self) -> Serializer<'b, S> {
         self.integers.clear();
         self.booleans.clear();
@@ -184,14 +177,6 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
         packer.write_int(self.strings.len() as i64); // maybe unnecessary?
         packer.write_int(self.property_types.len() as i64);
 
-        println!(
-            "serialize lens: {:?} {:?} {:?} {:?}",
-            self.integers.len(),
-            self.booleans.len(),
-            self.strings.len(),
-            self.property_types.len()
-        );
-
         for integer in &self.integers {
             packer.write_int(*integer);
         }
@@ -256,16 +241,10 @@ impl<S: IntoFormat> Deserializer<S> {
         let version = unpacker.read_byte()?;
         assert_eq!(version, S::version());
 
-        println!("version: {:?}", version);
-
         let int_len = unpacker.read_int()?;
         let bool_len = unpacker.read_int()?;
         let string_len = unpacker.read_int()?;
         let tags_len = unpacker.read_int()?;
-        println!(
-            "lens: {:?} {:?} {:?} {:?}",
-            int_len, bool_len, string_len, tags_len
-        );
 
         for _ in 0..int_len {
             self.integers.push_back(unpacker.read_int()?);
@@ -310,7 +289,6 @@ impl<S: IntoFormat> Deserializer<S> {
         let mut values = Vec::with_capacity(length);
         for _ in 0..length {
             let tag = self.take_property_type()?;
-            println!("tag: {:?}", tag);
 
             let value = match tag {
                 PropertyType::String => PropertyValue::String(self.take_string()?),

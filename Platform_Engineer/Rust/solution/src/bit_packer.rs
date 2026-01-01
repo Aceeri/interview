@@ -7,7 +7,8 @@ use crate::{serializer::PropertyType, ultra_packer};
 /// in configurations.
 ///
 /// Maybe we could steal some ideas from utf-8?
-const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
+// const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
+const INT_WIDTHS: [u8; 8] = [4, 6, 9, 13, 15, 24, 45, 64];
 const NULL_TERMINATOR: u8 = 0;
 
 // we use 32-126 + NUL, which is 96 values out of 127 (7 bits)
@@ -292,14 +293,31 @@ impl<'a> BitUnpacker<'a> {
         }
     }
 
+    pub fn read_bytes_width(&mut self, width: u8) -> Option<u64> {
+        assert!(width > 0);
+
+        let total_bytes = (width as usize + 7) / 8;
+        let remaining_bits = width % 8;
+
+        let mut value: u64 = 0;
+        if remaining_bits > 0 {
+            value = self.read_bits(remaining_bits)? as u64;
+            for _ in 0..total_bytes - 1 {
+                value = (value << 8) | (self.read_byte()? as u64);
+            }
+        } else {
+            for _ in 0..total_bytes {
+                value = (value << 8) | (self.read_byte()? as u64);
+            }
+        }
+
+        Some(value)
+    }
+
     pub fn read_int(&mut self) -> Option<i64> {
         let header = self.read_bits(3)?;
         let width = INT_WIDTHS[header as usize];
-
-        let mut value: u64 = 0;
-        for _ in 0..width {
-            value = (value << 1) | (self.read_bit()? as u64);
-        }
+        let value = self.read_bytes_width(width)?;
         Some(value as i64)
     }
 
@@ -333,8 +351,16 @@ impl<'a> BitUnpacker<'a> {
             }
         }
 
-        for _ in 0..remainder {
-            bytes.push(self.read_bits(7)?);
+        // Read remainder as smaller bundle (matching write)
+        if remainder > 0 {
+            let remainder_bits =
+                ultra_packer::bits_per_bundle(ASCII_MAX_VALUE as u64, remainder as u8);
+            let remainder_bundle = ultra_packer::read_bundle(self, remainder_bits)?;
+            let decoded =
+                ultra_packer::decode(remainder as u8, ASCII_MAX_VALUE as u64, remainder_bundle);
+            for byte in decoded {
+                bytes.push(uncompact_ascii(byte as u8));
+            }
         }
 
         // from_utf8_lossy_owned would be cool

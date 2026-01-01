@@ -2,13 +2,11 @@ use std::borrow::Cow;
 
 use crate::{serializer::PropertyType, ultra_packer};
 
-/// 3 bit header for the length of the integer
-/// Biased towards smaller numbers, since numbers greater than 2^32 seem like they'd be fairly uncommon
-/// in configurations.
-///
-/// Maybe we could steal some ideas from utf-8?
-// const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
-const INT_WIDTHS: [u8; 8] = [4, 6, 9, 13, 15, 24, 45, 64];
+/// UTF8-style integer length
+/// prefix: 0, 10, 110, 1110, 11110, 111110, 1111110
+/// widths: 3,  7,   9,   15,    24,     45,      64
+/// biased towards smaller values
+const INT_WIDTHS: [u8; 7] = [3, 7, 9, 15, 24, 45, 64];
 const NULL_TERMINATOR: u8 = 0;
 
 // we use 32-126 + NUL, which is 96 values out of 127 (7 bits)
@@ -107,13 +105,20 @@ impl<'a> BitPacker<'a> {
     }
 
     pub fn write_int(&mut self, int: i64) {
-        let header = INT_WIDTHS
+        let slot = INT_WIDTHS
             .iter()
-            .position(|&width| width >= 64 || int < (1i64 << width))
-            .unwrap_or(7);
-        let width = INT_WIDTHS[header];
+            .position(|&w| w >= 64 || int < (1i64 << w))
+            .unwrap_or(6);
+        let width = INT_WIDTHS[slot];
 
-        self.write_bits(header as u8, 3);
+        // Write prefix: slot ones followed by a zero (or all ones for last slot)
+        for _ in 0..slot {
+            self.write_bit(true);
+        }
+        if slot < 6 {
+            self.write_bit(false);
+        }
+
         self.write_bytes_width(&int.to_le_bytes(), width);
     }
 
@@ -283,8 +288,13 @@ impl<'a> BitUnpacker<'a> {
     }
 
     pub fn read_int(&mut self) -> Option<i64> {
-        let header = self.read_bits(3)?;
-        let width = INT_WIDTHS[header as usize];
+        // Count leading 1s to determine slot
+        let mut slot = 0;
+        while slot < 6 && self.read_bit()? {
+            slot += 1;
+        }
+
+        let width = INT_WIDTHS[slot];
         Some(self.read_bytes_width(width)? as i64)
     }
 

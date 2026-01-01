@@ -1,11 +1,30 @@
 use std::borrow::Cow;
 
-use crate::serializer::PropertyType;
+use crate::{serializer::PropertyType, ultra_packer};
 
 /// 3 bit header for the length of the integer
 /// Biased towards smaller numbers, since numbers greater than 2^32 seem like they'd be fairly uncommon
 /// in configurations.
 const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
+const NULL_TERMINATOR: u8 = 0;
+
+// we use 32-126 + NUL, which is 96 values out of 127 (7 bits)
+pub const ASCII_MAX_VALUE: u8 = 127 - UNUSED_ASCII;
+pub const UNUSED_ASCII: u8 = 1 /* DEL */ + 30 /* CONTROL CHARS - NUL */;
+
+// Not valid rust despite being const fn :(
+//const (ASCII_BUNDLE_SIZE, ASCII_BITS_PER_BUNDLE): (u8, u8) = ultra_packer::find_optimal_bundle(ASCII_MAX_VALUE as u64);
+pub const ASCII_BUNDLE_SIZE: u8 = ultra_packer::find_optimal_bundle_size(ASCII_MAX_VALUE as u64);
+pub const ASCII_BITS_PER_BUNDLE: u8 =
+    ultra_packer::find_optimal_bits_per_bundle(ASCII_MAX_VALUE as u64);
+
+fn compact_ascii(ascii: u8) -> u8 {
+    if ascii == 0 { 0 } else { ascii - UNUSED_ASCII }
+}
+
+fn uncompact_ascii(ascii: u8) -> u8 {
+    if ascii == 0 { 0 } else { ascii + UNUSED_ASCII }
+}
 
 pub struct BitPacker<'a> {
     pub buffer: &'a mut Vec<u8>,
@@ -119,10 +138,52 @@ impl<'a> BitPacker<'a> {
         self.write_bytes_width(&int.to_le_bytes(), width);
     }
 
-    pub fn write_string(&mut self, strings: &Cow<str>) {
-        const NULL_TERMINATOR: u8 = 0;
-        self.write_bytes(strings.as_bytes());
+    pub fn write_string(&mut self, string: &Cow<str>) {
+        self.write_bytes(string.as_bytes());
         self.write_byte(NULL_TERMINATOR)
+    }
+
+    pub fn write_ascii_string(&mut self, string: &Cow<str>) {
+        let bytes = string
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(NULL_TERMINATOR));
+        for byte in bytes {
+            self.write_bits(byte, 7);
+        }
+    }
+
+    // skipping just the msb bit saves us a bit, however we are still not using
+    // 1-32 and DEL, so we have about 75% usage of the space.
+    //
+    // Try grouping characters to reduce this.
+    pub fn write_ascii_string_ultrapacked(&mut self, string: &Cow<str>) {
+        // non-pow-2 bitpacking via grouping sequences
+        let mut bytes = string
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(NULL_TERMINATOR));
+
+        let mut bundle_buffer = [0u64; ASCII_BUNDLE_SIZE as usize];
+        'OUTER: loop {
+            // get a chunk of ASCII_BUNDLE_SIZE
+            for i in 0..ASCII_BUNDLE_SIZE as usize {
+                let next_byte = bytes.next();
+                if i == 0 && next_byte.is_none() {
+                    break 'OUTER;
+                }
+                bundle_buffer[i] = compact_ascii(next_byte.unwrap_or(0)) as u64;
+            }
+
+            let bundle = ultra_packer::encode(
+                ASCII_BUNDLE_SIZE,
+                ASCII_MAX_VALUE as u64,
+                bundle_buffer.as_slice(),
+            );
+            ultra_packer::write_bundle(self, ASCII_BITS_PER_BUNDLE, bundle);
+        }
     }
 
     pub fn write_property_type(&mut self, tag: PropertyType) {
@@ -218,6 +279,40 @@ impl<'a> BitUnpacker<'a> {
             value = (value << 1) | (self.read_bit()? as u64);
         }
         Some(value as i64)
+    }
+
+    pub fn read_ascii_string(&mut self) -> Option<String> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = self.read_bits(7)?;
+            if byte == 0 {
+                break;
+            }
+
+            bytes.push(byte);
+        }
+
+        // from_utf8_lossy_owned would be cool
+        Some(String::from_utf8_lossy(bytes.as_slice()).into_owned())
+    }
+
+    pub fn read_ascii_string_ultrapacked(&mut self) -> Option<String> {
+        let mut bytes = Vec::new();
+
+        'END: loop {
+            let bundle = ultra_packer::read_bundle(self, ASCII_BITS_PER_BUNDLE)?;
+            let decoded = ultra_packer::decode(ASCII_BUNDLE_SIZE, ASCII_MAX_VALUE as u64, bundle);
+            for byte in decoded {
+                if byte == 0 {
+                    break 'END;
+                }
+
+                bytes.push(uncompact_ascii(byte as u8));
+            }
+        }
+
+        // from_utf8_lossy_owned would be cool
+        Some(String::from_utf8_lossy(bytes.as_slice()).into_owned())
     }
 
     pub fn read_string(&mut self) -> Option<String> {

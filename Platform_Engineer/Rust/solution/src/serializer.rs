@@ -3,13 +3,11 @@ use std::{borrow::Cow, collections::VecDeque, marker::PhantomData};
 use crate::bit_packer::{BitPacker, BitUnpacker};
 
 // Assumptions/requirements about schemas:
-// - Primarily focus on small configs, but scale ok to larger ones if needed.
+// - Primarily focus on small configs, but scale ok to larger ones if needed. Thinking things like
+//   image metadata/EXIF or program parameters.
 // - Source of data is verified outside of serializing/deserializing, but invalid properties should still
 //   be caught in case of any form of data corruption.
-// - Versioning of schemas is handled by the user/tooling.
-// - Schemas are compressed after serialization via mature libraries such as zstd/lz4, preprocessing and
-//   entropy encoding is left out of the format to prevent interference with these more mature libraries,
-//   instead focus mainly on reducing the amount of pointless entropy in our data.
+// - Version id assignment of schemas is handled by the user/tooling.
 
 #[derive(Debug, Default)]
 pub struct Serializer<'a, S: IntoFormat> {
@@ -17,7 +15,7 @@ pub struct Serializer<'a, S: IntoFormat> {
     // nested structs would do the same.
 
     // Keep similar types next to each other for 2 reasons:
-    // - Based on some prior work on vertex compression, I found that grouping data together can get you
+    // - Based on some prior work on vertex compression, grouping data together can get you
     //   closer to theoretical entropy limits.
     // - Compressors generally also like homogenous data nearby, improves pre-processing steps which then
     //   improves overall compression.
@@ -25,22 +23,25 @@ pub struct Serializer<'a, S: IntoFormat> {
     // Main assumption: these are likely to be very small integers and fairly similar to eachother
     //
     // 3 bit bit length header with concentration around smaller numbers seems good, I don't think 4 bits
-    // is really worth it since then your header is likely largely than the data itself, but I could be wrong.
+    // is really worth it since then your header is likely largely than the data itself.
     //
     // delta encoding?
     // daniel lemire's FastPFOR or similar would be worthwhile if we were expecting larger amounts of integers.
     integers: Vec<i64>,
-    // UTF-8 is fairly compact already, just write that to the buffer. Delta encoding might be the worthwhile here
-    // too for compression assuming its mostly alphanumeric.
+    // UTF-8 is fairly compact already, just write that to the buffer if need be.
     //
-    // null terminating the strings is a bit dangerous, but saves us a bit on bits. If we used the same format as
-    // integers for the string length, then we only save on bits up to 16 bytes in, which seems unlikely.
+    // null terminating the strings is a bit dangerous, but even if we used the same format as
+    // integers for the string length, then we only save on bits up to 16 bytes in, which seems too close to
+    // a median for probable values.
     //
-    // technically if just ascii is enough, then we could compact to 7 bits easily
+    // If all strings are ascii, then we could compact to 7 bits easily.
     // 1-32 are also unused which means we are still only using 75% of the values, so this could be compressed
     // further if we are given a sequence of characters
+    //
+    // Lets try using a single bit header of "all-ascii", then we can encode the common path better.
     strings: Vec<Cow<'a, str>>,
-    // booleans can just be bitpacked directly, meets shannon entropy theoretical limit directly
+    // booleans can just be bitpacked directly, RLE *may* help sometimes, but given mostly random booleans
+    // it'll just bloat this size.
     booleans: Vec<bool>,
     // arrays can be dynamically typed and sized and nested
     //
@@ -169,12 +170,25 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
         }
     }
 
+    // are we ascii & are we above the "control" characters?
+    // if so we can save at least
+    pub fn all_32_127(&self) -> bool {
+        self.strings
+            .iter()
+            .any(|string| string.chars().any(|c| c as u32 >= 32 && c as u32 <= 127))
+    }
+
     pub fn finish(&self, buffer: &mut Vec<u8>) {
         let mut packer = BitPacker::new(buffer);
         packer.write_byte(S::version());
+
+        // per type headers
         packer.write_int(self.integers.len() as i64);
         packer.write_int(self.booleans.len() as i64);
-        packer.write_int(self.strings.len() as i64); // maybe unnecessary?
+        let all_ascii = self.all_32_127();
+        // let all_ascii = false;
+        packer.write_bit(all_ascii);
+        packer.write_int(self.strings.len() as i64);
         packer.write_int(self.property_types.len() as i64);
 
         for integer in &self.integers {
@@ -186,7 +200,13 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
         }
 
         for string in &self.strings {
-            packer.write_string(string);
+            if all_ascii {
+                // packer.write_ascii_string(string);
+                packer.write_ascii_string_ultrapacked(string);
+            } else {
+                // need to encode as utf-8 directly
+                packer.write_string(string);
+            }
         }
 
         for tag in &self.property_types {
@@ -243,7 +263,10 @@ impl<S: IntoFormat> Deserializer<S> {
 
         let int_len = unpacker.read_int()?;
         let bool_len = unpacker.read_int()?;
+
+        let all_ascii = unpacker.read_bit()?;
         let string_len = unpacker.read_int()?;
+
         let tags_len = unpacker.read_int()?;
 
         for _ in 0..int_len {
@@ -254,8 +277,16 @@ impl<S: IntoFormat> Deserializer<S> {
             self.booleans.push_back(unpacker.read_bit()?);
         }
 
-        for _ in 0..string_len {
-            self.strings.push_back(unpacker.read_string()?);
+        if all_ascii {
+            for _ in 0..string_len {
+                // self.strings.push_back(unpacker.read_ascii_string()?);
+                self.strings
+                    .push_back(unpacker.read_ascii_string_ultrapacked()?);
+            }
+        } else {
+            for _ in 0..string_len {
+                self.strings.push_back(unpacker.read_string()?);
+            }
         }
 
         for _ in 0..tags_len {

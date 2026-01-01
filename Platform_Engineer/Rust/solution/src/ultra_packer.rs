@@ -11,11 +11,9 @@ use crate::bit_packer::{BitPacker, BitUnpacker};
 // 3d array of 18x18x18 will be 5832 elements, indexing this via each axis like:
 // - needs 2^5, but that wastes 14 values per axis, 43.75% of the space allocated to it.
 // indexing it via a simple linearization scheme: x + y * 18 + z * 18 * 18
-// means we only need a number for `5832` which requires 13 bits and wastes 28.8%.
-// but we've saved 2 bits.
+// means we only need a number for `5832` which requires 13 bits savings 2 bits.
 //
 // `UltraPacker` is a mostly an abstraction of this
-//
 //
 // https://save-buffer.github.io/ultrapack.html
 
@@ -31,8 +29,6 @@ pub const fn find_optimal_bits_per_bundle(max_value: u64) -> u8 {
 }
 
 pub const fn find_optimal_bundle(max_value: u64) -> (u8, u8) {
-    // let log2_n = (max_value as f64).log2();
-    // let naive_bits = log2_n.ceil() as u8;
     let naive_bits = if max_value == 0 {
         0
     } else {
@@ -115,48 +111,3 @@ pub fn read_bundle(unpacker: &mut BitUnpacker, bits_per_bundle: u8) -> Option<u6
     }
     Some(value)
 }
-
-// int ComputeK(int n)
-// {
-//     double bits_per_value = 10000;
-//     int bits_per_group = 0;
-//     int elts_per_group = 0;
-//     for(int num_bits_per_group = 1; num_bits_per_group <= 56; num_bits_per_group++)
-//     {
-//         for(int num_elts_per_group = 1; num_elts_per_group < 100; num_elts_per_group++)
-//         {
-//             if(log(2) * num_bits_per_group < log(n) * num_elts_per_group)
-//                 break;
-//             double bpv = static_cast<double>(num_bits_per_group) / static_cast<double>(num_elts_per_group);
-//             if(bpv < bits_per_value - 0.05)
-//             {
-//                 bits_per_value = bpv;
-//                 bits_per_group = num_bits_per_group;
-//                 elts_per_group = num_elts_per_group;
-//             }
-//         }
-//     }
-//     return elts_per_group;
-// }
-
-// pub fn compute_k(n: u64) -> u64 {
-//     double bits_per_value = 10000;
-//     int bits_per_group = 0;
-//     int elts_per_group = 0;
-//     for(int num_bits_per_group = 1; num_bits_per_group <= 56; num_bits_per_group++)
-//     {
-//         for(int num_elts_per_group = 1; num_elts_per_group < 100; num_elts_per_group++)
-//         {
-//             if(log(2) * num_bits_per_group < log(n) * num_elts_per_group)
-//                 break;
-//             double bpv = static_cast<double>(num_bits_per_group) / static_cast<double>(num_elts_per_group);
-//             if(bpv < bits_per_value - 0.05)
-//             {
-//                 bits_per_value = bpv;
-//                 bits_per_group = num_bits_per_group;
-//                 elts_per_group = num_elts_per_group;
-//             }
-//         }
-//     }
-//     return elts_per_group;
-// }

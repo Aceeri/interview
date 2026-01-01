@@ -3,14 +3,13 @@ use std::{borrow::Cow, collections::VecDeque, marker::PhantomData};
 use crate::bit_packer::{BitPacker, BitUnpacker};
 
 // Assumptions/requirements about schemas:
-// - Primarily focus on small configs, but scale ok to larger ones if needed. Thinking things like
-//   image metadata/EXIF or program parameters.
+// - Primarily focus on small configs, avoid bloating beyond initial size.
 // - Source of data is verified outside of serializing/deserializing, but invalid properties should still
 //   be caught in case of any form of data corruption.
 // - Version id assignment of schemas is handled by the user/tooling.
 
 #[derive(Debug, Default)]
-pub struct Serializer<'a, S: IntoFormat> {
+pub struct Serializer<'a> {
     // each property is order-dependent, arrays are flattened into this structure and theoretically
     // nested structs would do the same.
 
@@ -49,8 +48,6 @@ pub struct Serializer<'a, S: IntoFormat> {
     //
     // 2 bits per tag
     property_types: Vec<PropertyType>,
-
-    marker: PhantomData<S>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -82,7 +79,7 @@ impl PropertyType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PropertyValue {
     String(String),
     Bool(bool),
@@ -101,19 +98,18 @@ fn reuse_vec<T, U>(mut v: Vec<T>) -> Vec<U> {
     v.into_iter().map(|_| unreachable!()).collect()
 }
 
-impl<'a, S: IntoFormat> Serializer<'a, S> {
+impl<'a> Serializer<'a> {
     pub fn new() -> Self {
         Self {
             integers: Vec::new(),
             strings: Vec::new(),
             booleans: Vec::new(),
             property_types: Vec::new(),
-            marker: PhantomData,
         }
     }
 
     // should generally hint to the compiler enough that we can re-use this serializer.
-    pub fn reuse<'b>(mut self) -> Serializer<'b, S> {
+    pub fn reuse<'b>(mut self) -> Serializer<'b> {
         self.integers.clear();
         self.booleans.clear();
         self.property_types.clear();
@@ -122,7 +118,6 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
             strings: reuse_vec(self.strings),
             booleans: self.booleans,
             property_types: self.property_types,
-            marker: PhantomData,
         }
     }
 
@@ -178,9 +173,35 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
             .any(|string| string.chars().any(|c| c as u32 >= 32 && c as u32 <= 127))
     }
 
-    pub fn finish(&self, buffer: &mut Vec<u8>) {
+    pub fn finish_native(&self, buffer: &mut Vec<u8>, version: u8) {
         let mut packer = BitPacker::new(buffer);
-        packer.write_byte(S::version());
+        packer.write_byte(version);
+        packer.write_bytes(&(self.integers.len() as i64).to_le_bytes());
+        packer.write_bytes(&(self.booleans.len() as i64).to_le_bytes());
+        packer.write_bytes(&(self.strings.len() as i64).to_le_bytes());
+        packer.write_bytes(&(self.property_types.len() as i64).to_le_bytes());
+
+        for integer in &self.integers {
+            packer.write_bytes(&integer.to_le_bytes());
+        }
+
+        for string in &self.strings {
+            packer.write_bytes(string.as_bytes());
+        }
+
+        for boolean in &self.booleans {
+            packer.write_bytes(&[*boolean as u8]);
+        }
+
+        for tag in &self.property_types {
+            let (byte, _) = tag.to_bits();
+            packer.write_bytes(&[byte]);
+        }
+    }
+
+    pub fn finish(&self, buffer: &mut Vec<u8>, version: u8) {
+        let mut packer = BitPacker::new(buffer);
+        packer.write_byte(version);
 
         // per type headers
         packer.write_int(self.integers.len() as i64);
@@ -212,54 +233,34 @@ impl<'a, S: IntoFormat> Serializer<'a, S> {
         for tag in &self.property_types {
             packer.write_property_type(*tag);
         }
-
-        let native = self.native_bytes();
-        let buffer = buffer.len();
-        eprintln!(
-            "buffer: {:?}, native: {:?}, compression: {:?}",
-            buffer,
-            native,
-            buffer as f32 / native as f32
-        );
-    }
-
-    pub fn native_bytes(&self) -> usize {
-        std::mem::size_of::<bool>() * self.booleans.len()
-            + std::mem::size_of::<i64>() * self.integers.len()
-            + self.strings.iter().map(|s| s.len()).sum::<usize>()
-            + std::mem::size_of::<PropertyType>() * self.property_types.len()
     }
 }
 
 #[derive(Debug)]
-pub struct Deserializer<S: IntoFormat> {
+pub struct Deserializer {
     // buffers
     integers: VecDeque<i64>,
     strings: VecDeque<String>,
     booleans: VecDeque<bool>,
     property_types: VecDeque<PropertyType>,
-
-    marker: PhantomData<S>,
 }
 
-impl<S: IntoFormat> Deserializer<S> {
+impl Deserializer {
     pub fn new() -> Self {
         Self {
             integers: Default::default(),
             strings: Default::default(),
             booleans: Default::default(),
             property_types: Default::default(),
-
-            marker: PhantomData,
         }
     }
 
     // should ideally a `Result`
-    pub fn read_bytes(&mut self, bytes: &[u8]) -> Option<()> {
+    pub fn read_bytes(&mut self, bytes: &[u8], version: u8) -> Option<()> {
         let mut unpacker = BitUnpacker::new(bytes);
 
-        let version = unpacker.read_byte()?;
-        assert_eq!(version, S::version());
+        let read_version = unpacker.read_byte()?;
+        assert_eq!(read_version, version);
 
         let int_len = unpacker.read_int()?;
         let bool_len = unpacker.read_int()?;
@@ -335,11 +336,17 @@ impl<S: IntoFormat> Deserializer<S> {
 }
 
 pub trait IntoFormat {
-    fn version() -> u8;
-    fn serialize<'a>(&'a self, serializer: &mut Serializer<'a, Self>)
+    fn serialize<'a>(&'a self, serializer: &mut Serializer<'a>)
     where
         Self: Sized;
-    fn deserialize(data: &[u8], deserializer: &mut Deserializer<Self>) -> Option<Self>
+    fn take(deserializer: &mut Deserializer) -> Option<Self>
     where
         Self: Sized;
+    fn deserialize(data: &[u8], deserializer: &mut Deserializer, version: u8) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        deserializer.read_bytes(data, version)?;
+        Self::take(deserializer)
+    }
 }

@@ -5,6 +5,8 @@ use crate::{serializer::PropertyType, ultra_packer};
 /// 3 bit header for the length of the integer
 /// Biased towards smaller numbers, since numbers greater than 2^32 seem like they'd be fairly uncommon
 /// in configurations.
+///
+/// Maybe we could steal some ideas from utf-8?
 const INT_WIDTHS: [u8; 8] = [4, 6, 8, 12, 16, 24, 32, 64];
 const NULL_TERMINATOR: u8 = 0;
 
@@ -12,7 +14,7 @@ const NULL_TERMINATOR: u8 = 0;
 pub const ASCII_MAX_VALUE: u8 = 127 - UNUSED_ASCII;
 pub const UNUSED_ASCII: u8 = 1 /* DEL */ + 30 /* CONTROL CHARS - NUL */;
 
-// Not valid rust despite being const fn :(
+// Not valid rust :(
 //const (ASCII_BUNDLE_SIZE, ASCII_BITS_PER_BUNDLE): (u8, u8) = ultra_packer::find_optimal_bundle(ASCII_MAX_VALUE as u64);
 pub const ASCII_BUNDLE_SIZE: u8 = ultra_packer::find_optimal_bundle_size(ASCII_MAX_VALUE as u64);
 pub const ASCII_BITS_PER_BUNDLE: u8 =
@@ -130,7 +132,7 @@ impl<'a> BitPacker<'a> {
     pub fn write_int(&mut self, int: i64) {
         let header = INT_WIDTHS
             .iter()
-            .position(|&width| int < (1i64 << width))
+            .position(|&width| width >= 64 || int < (1i64 << width))
             .unwrap_or(7);
         let width = INT_WIDTHS[header];
 
@@ -160,30 +162,41 @@ impl<'a> BitPacker<'a> {
     // Try grouping characters to reduce this.
     pub fn write_ascii_string_ultrapacked(&mut self, string: &Cow<str>) {
         // non-pow-2 bitpacking via grouping sequences
-        let mut bytes = string
-            .as_bytes()
-            .iter()
-            .copied()
-            .chain(std::iter::once(NULL_TERMINATOR));
+        let mut bytes = string.as_bytes().iter().copied();
+
+        let (bundles, remainder) = Self::string_bundles(string);
+
+        // length header
+        // write as bundles + remainder?
+        let length = bundles * ASCII_BUNDLE_SIZE as usize + remainder;
+        self.write_int(length as i64);
 
         let mut bundle_buffer = [0u64; ASCII_BUNDLE_SIZE as usize];
-        'OUTER: loop {
+        for _ in 0..bundles {
             // get a chunk of ASCII_BUNDLE_SIZE
             for i in 0..ASCII_BUNDLE_SIZE as usize {
-                let next_byte = bytes.next();
-                if i == 0 && next_byte.is_none() {
-                    break 'OUTER;
-                }
-                bundle_buffer[i] = compact_ascii(next_byte.unwrap_or(0)) as u64;
+                let next_byte = bytes
+                    .next()
+                    .expect("should have a next byte in string while bundling");
+                bundle_buffer[i] = compact_ascii(next_byte) as u64;
             }
 
-            let bundle = ultra_packer::encode(
-                ASCII_BUNDLE_SIZE,
-                ASCII_MAX_VALUE as u64,
-                bundle_buffer.as_slice(),
-            );
+            let bundle =
+                ultra_packer::encode(ASCII_BUNDLE_SIZE, ASCII_MAX_VALUE as u64, &bundle_buffer);
             ultra_packer::write_bundle(self, ASCII_BITS_PER_BUNDLE, bundle);
         }
+
+        // write remainder as 7 bit ascii codes
+        for _ in 0..remainder {
+            let byte = bytes.next().expect("should still have a remainder byte");
+            self.write_bits(byte, 7);
+        }
+    }
+
+    fn string_bundles(string: &str) -> (usize, usize) {
+        let bundles = string.len() / ASCII_BUNDLE_SIZE as usize;
+        let remainder = string.len() % ASCII_BUNDLE_SIZE as usize;
+        (bundles, remainder)
     }
 
     pub fn write_property_type(&mut self, tag: PropertyType) {
@@ -285,7 +298,7 @@ impl<'a> BitUnpacker<'a> {
         let mut bytes = Vec::new();
         loop {
             let byte = self.read_bits(7)?;
-            if byte == 0 {
+            if byte == NULL_TERMINATOR {
                 break;
             }
 
@@ -299,16 +312,20 @@ impl<'a> BitUnpacker<'a> {
     pub fn read_ascii_string_ultrapacked(&mut self) -> Option<String> {
         let mut bytes = Vec::new();
 
-        'END: loop {
+        let length = self.read_int()?;
+        let bundles = length as usize / ASCII_BUNDLE_SIZE as usize;
+        let remainder = length as usize % ASCII_BUNDLE_SIZE as usize;
+
+        for _ in 0..bundles {
             let bundle = ultra_packer::read_bundle(self, ASCII_BITS_PER_BUNDLE)?;
             let decoded = ultra_packer::decode(ASCII_BUNDLE_SIZE, ASCII_MAX_VALUE as u64, bundle);
             for byte in decoded {
-                if byte == 0 {
-                    break 'END;
-                }
-
                 bytes.push(uncompact_ascii(byte as u8));
             }
+        }
+
+        for _ in 0..remainder {
+            bytes.push(self.read_bits(7)?);
         }
 
         // from_utf8_lossy_owned would be cool
@@ -319,14 +336,14 @@ impl<'a> BitUnpacker<'a> {
         let mut bytes = Vec::new();
         loop {
             let byte = self.read_byte()?;
-            if byte == 0 {
+            if byte == NULL_TERMINATOR {
                 break;
             }
 
             bytes.push(byte);
         }
 
-        // from_utf8_lossy_owned would be cool
+        // from_utf8_lossy_owned would be nice
         Some(String::from_utf8_lossy(bytes.as_slice()).into_owned())
     }
 
@@ -401,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    pub fn roundtrip() {
+    pub fn sanity() {
         let mut buffer = Vec::new();
         let mut packer = BitPacker::new(&mut buffer);
 
@@ -418,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    pub fn roundtrip_int() {
+    pub fn sanity_int() {
         let mut buffer = Vec::new();
         let mut packer = BitPacker::new(&mut buffer);
 

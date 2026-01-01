@@ -11,21 +11,21 @@ pub struct Config {
     name: String,
     cool: bool,
     arr: Vec<PropertyValue>,
-    other: OtherConfig,
+    nested: NestedConfig,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct OtherConfig {
+pub struct NestedConfig {
     nested: i64,
 }
 
-impl IntoFormat for OtherConfig {
+impl IntoFormat for NestedConfig {
     fn serialize<'a>(&'a self, serializer: &mut Serializer<'a>) {
         serializer.write_int(self.nested);
     }
 
     fn take(deserializer: &mut Deserializer) -> Option<Self> {
-        Some(OtherConfig {
+        Some(NestedConfig {
             nested: deserializer.take_int()?,
         })
     }
@@ -37,7 +37,7 @@ impl IntoFormat for Config {
         serializer.write_string(self.name.as_str());
         serializer.write_bool(self.cool);
         serializer.write_array(self.arr.as_slice());
-        self.other.serialize(serializer);
+        self.nested.serialize(serializer);
     }
 
     fn take(deserializer: &mut Deserializer) -> Option<Self> {
@@ -46,7 +46,7 @@ impl IntoFormat for Config {
             name: deserializer.take_string()?,
             cool: deserializer.take_bool()?,
             arr: deserializer.take_array()?,
-            other: OtherConfig::take(deserializer)?,
+            nested: NestedConfig::take(deserializer)?,
         })
     }
 }
@@ -59,7 +59,8 @@ fn main() {
         data: 4,
         name: "Nice".to_owned(),
         cool: true,
-        other: OtherConfig { nested: 0 },
+        nested: NestedConfig { nested: 0 },
+        // can modify this as you wish to test values out
         arr: vec![
             PropertyValue::String("46:392814.29".to_owned()),
             // PropertyValue::String("testing".to_owned()),
@@ -175,17 +176,4 @@ fn main() {
     println!("expected: {:?}", config);
     println!("got:      {:?}", deser_config);
     assert_eq!(Some(&config), deser_config.as_ref(), "round-trip failed");
-
-    // Testing to see how zstd fairs vs bitpacking
-    //
-    // Use native buffer instead of bitpacked, since the bitpacking can cause issues with entropy encoding.
-    //
-    // Compress with zstd
-    let compressed = zstd::bulk::compress(&native_buffer, 3).expect("zstd compression failed");
-    println!("native buffer: {} bytes", native_buffer.len());
-    println!("zstd compressed: {} bytes", compressed.len());
-    println!(
-        "zstd compression: {:.1}%",
-        (1.0 - compressed.len() as f64 / native_buffer.len() as f64) * 100.0
-    );
 }

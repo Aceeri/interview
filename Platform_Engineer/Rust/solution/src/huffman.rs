@@ -1,11 +1,8 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-// Character frequencies tuned for config/metadata strings
-// Hand-tuned based on: EXIF metadata, file paths, game saves, API configs,
-// editor settings, package.json, k8s manifests, .env files, numeric data
 const CHAR_FREQUENCIES: &[(u8, u32)] = &[
-    // Lowercase (tuned for config patterns)
+    // Lowercase
     (b'e', 710),
     (b'o', 500),
     (b'a', 470),
@@ -42,7 +39,7 @@ const CHAR_FREQUENCIES: &[(u8, u32)] = &[
     (b'7', 120),
     (b'8', 100),
     (b'9', 90),
-    // Punctuation (config-specific)
+    // Punctuation
     (b'.', 330),
     (b' ', 200),
     (b'/', 200),
@@ -55,7 +52,7 @@ const CHAR_FREQUENCIES: &[(u8, u32)] = &[
     (b')', 10),
     (b'~', 10),
     (b'+', 10),
-    // Uppercase (common in configs: ENV_VARS, constants)
+    // Uppercase
     (b'E', 230),
     (b'O', 160),
     (b'S', 160),
@@ -107,113 +104,101 @@ const CHAR_FREQUENCIES: &[(u8, u32)] = &[
     (b'\\', 8),
 ];
 
-fn build_optimal_lengths(freq: &[(u8, u32)], max_len: u8) -> Vec<(u8, u8)> {
-    if freq.is_empty() {
-        return vec![];
+struct Symbol {
+    byte: u8,
+    len: u8,
+    probability: f64,
+}
+
+impl Symbol {
+    fn kraft_contribution(&self) -> f64 {
+        2.0_f64.powi(-(self.len as i32))
     }
 
-    // Sort by frequency (descending) for better initial assignment
-    let mut sorted: Vec<(u8, u32)> = freq.to_vec();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    fn kraft_cost_to_shorten(&self) -> f64 {
+        2.0_f64.powi(-((self.len - 1) as i32)) - self.kraft_contribution()
+    }
+}
 
-    // Calculate ideal lengths: l_i = -log2(p_i) where p_i = freq_i / total
-    let total: u64 = sorted.iter().map(|(_, f)| *f as u64).sum();
+fn kraft_sum(symbols: &[Symbol]) -> f64 {
+    symbols.iter().map(|s| s.kraft_contribution()).sum()
+}
+
+fn build_optimal_lengths(frequencies: &[(u8, u32)], max_len: u8) -> Vec<(u8, u8)> {
+    let total: u64 = frequencies.iter().map(|(_, f)| *f as u64).sum();
     if total == 0 {
-        return sorted.iter().map(|&(c, _)| (c, max_len)).collect();
+        return frequencies.iter().map(|&(b, _)| (b, max_len)).collect();
     }
 
-    let mut lengths: Vec<(u8, u8, f64)> = sorted
+    let mut symbols: Vec<Symbol> = frequencies
         .iter()
-        .map(|&(c, f)| {
-            let p = f as f64 / total as f64;
-            let ideal_len = if p > 0.0 { -p.log2() } else { max_len as f64 };
-            (c, ideal_len.ceil().min(max_len as f64) as u8, p)
+        .map(|&(byte, freq)| {
+            let probability = freq as f64 / total as f64;
+            let ideal_len = (-probability.log2()).ceil().min(max_len as f64) as u8;
+            Symbol {
+                byte,
+                len: ideal_len,
+                probability,
+            }
         })
         .collect();
 
-    // Adjust lengths to satisfy Kraft inequality: Σ 2^(-len) <= 1
-    loop {
-        let kraft_sum: f64 = lengths
-            .iter()
-            .map(|(_, l, _)| 2.0_f64.powi(-(*l as i32)))
-            .sum();
+    symbols.sort_by(|a, b| b.probability.partial_cmp(&a.probability).unwrap());
 
-        if kraft_sum <= 1.0 + 1e-9 {
-            break;
-        }
+    while kraft_sum(&symbols) > 1.0 + 1e-9 {
+        let lowest_prob_shortenable = symbols
+            .iter_mut()
+            .filter(|s| s.len < max_len)
+            .min_by(|a, b| a.probability.partial_cmp(&b.probability).unwrap());
 
-        // Find symbol with shortest length that can be increased
-        if let Some(idx) = lengths
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, l, _))| *l < max_len)
-            .min_by(|(_, (_, _, p1)), (_, (_, _, p2))| p1.partial_cmp(p2).unwrap())
-            .map(|(i, _)| i)
-        {
-            lengths[idx].1 += 1;
-        } else {
-            break;
+        match lowest_prob_shortenable {
+            Some(symbol) => symbol.len += 1,
+            None => break,
         }
     }
 
-    // Try to use unused Kraft slack by shortening high-frequency codes
     loop {
-        let kraft_sum: f64 = lengths
-            .iter()
-            .map(|(_, l, _)| 2.0_f64.powi(-(*l as i32)))
-            .sum();
-        let slack = 1.0 - kraft_sum;
+        let slack = 1.0 - kraft_sum(&symbols);
 
-        // Find symbol that would benefit most from shorter code
-        if let Some(idx) = lengths
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, l, _))| *l > 1)
-            .filter(|(_, (_, l, _))| {
-                2.0_f64.powi(-((*l - 1) as i32)) - 2.0_f64.powi(-(*l as i32)) <= slack + 1e-9
-            })
-            .max_by(|(_, (_, _, p1)), (_, (_, _, p2))| p1.partial_cmp(p2).unwrap())
-            .map(|(i, _)| i)
-        {
-            lengths[idx].1 -= 1;
-        } else {
-            break;
+        let best_to_shorten = symbols
+            .iter_mut()
+            .filter(|s| s.len > 1 && s.kraft_cost_to_shorten() <= slack + 1e-9)
+            .max_by(|a, b| a.probability.partial_cmp(&b.probability).unwrap());
+
+        match best_to_shorten {
+            Some(symbol) => symbol.len -= 1,
+            None => break,
         }
     }
 
-    lengths.into_iter().map(|(c, l, _)| (c, l)).collect()
+    symbols.into_iter().map(|s| (s.byte, s.len)).collect()
 }
 
 fn build_canonical_codes(lengths: &[(u8, u8)]) -> HashMap<u8, (u16, u8)> {
-    let mut table = HashMap::new();
-
     if lengths.is_empty() {
-        return table;
+        return HashMap::new();
     }
 
-    // Sort by length, then by symbol for canonical ordering
-    let mut sorted: Vec<(u8, u8)> = lengths.to_vec();
-    sorted.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut symbols: Vec<(u8, u8)> = lengths.to_vec();
+    symbols.sort_by_key(|&(byte, len)| (len, byte));
 
-    let max_len = sorted.iter().map(|&(_, l)| l).max().unwrap_or(0);
+    let max_len = symbols.iter().map(|&(_, len)| len).max().unwrap() as usize;
 
-    // Count symbols at each length
-    let mut bl_count = vec![0u32; max_len as usize + 1];
-    for &(_, len) in &sorted {
-        bl_count[len as usize] += 1;
+    let mut count_at_length = vec![0u16; max_len + 1];
+    for &(_, len) in &symbols {
+        count_at_length[len as usize] += 1;
     }
 
-    // Compute first code for each length
-    let mut next_code = vec![0u16; max_len as usize + 1];
-    let mut code = 0u16;
-    for bits in 1..=max_len {
-        code = (code + bl_count[bits as usize - 1] as u16) << 1;
-        next_code[bits as usize] = code;
+    let mut first_code_at_length = vec![0u16; max_len + 1];
+    for len in 1..=max_len {
+        first_code_at_length[len] = (first_code_at_length[len - 1] + count_at_length[len - 1]) << 1;
     }
 
-    // Assign codes to symbols
-    for &(ch, len) in &sorted {
-        table.insert(ch, (next_code[len as usize], len));
+    let mut next_code = first_code_at_length;
+    let mut table = HashMap::new();
+    for (byte, len) in symbols {
+        let code = next_code[len as usize];
+        table.insert(byte, (code, len));
         next_code[len as usize] += 1;
     }
 
@@ -221,18 +206,24 @@ fn build_canonical_codes(lengths: &[(u8, u8)]) -> HashMap<u8, (u16, u8)> {
 }
 
 pub const HUFFMAN_MAX_LEN: u8 = 12;
+
+// build a LUT of every u16 that matches the 12 bit suffix
+// basically just fill the last 4 bits with every possibility
+// e.g.
+// 0b10011011_110000 => 'e'
+// 0b10011011_110001 => 'e'
+// 0b10011011_110010 => 'e'
+// ...
 fn build_decode_table(encode_table: &HashMap<u8, (u16, u8)>) -> Vec<(u8, u8)> {
     let table_size = 1usize << HUFFMAN_MAX_LEN;
     let mut table = vec![(0u8, 0u8); table_size];
 
-    for (&ch, &(code, len)) in encode_table {
-        // Number of entries this code covers (all suffixes)
+    for (&character, &(code, len)) in encode_table {
         let suffix_count = 1usize << (HUFFMAN_MAX_LEN - len);
-        // Left-align the code to max_len bits
         let base_index = (code as usize) << (HUFFMAN_MAX_LEN - len);
 
         for suffix in 0..suffix_count {
-            table[base_index | suffix] = (ch, len);
+            table[base_index | suffix] = (character, len);
         }
     }
 

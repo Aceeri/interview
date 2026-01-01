@@ -13,7 +13,9 @@ use crate::bit_packer::{BitPacker, BitUnpacker};
 // indexing it via a simple linearization scheme: x + y * 18 + z * 18 * 18
 // means we only need a number for `5832` which requires 13 bits savings 2 bits.
 //
-// `UltraPacker` is a mostly an abstraction of this
+//
+// `UltraPacker` is a mostly an abstraction of this concept, where 18 is the max value,
+// 3 is the bundle size and 13 bits is the bits per bundle.
 //
 // https://save-buffer.github.io/ultrapack.html
 

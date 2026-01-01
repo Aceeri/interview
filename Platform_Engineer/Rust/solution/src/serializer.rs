@@ -19,25 +19,17 @@ pub struct Serializer<'a> {
     // - Compressors generally also like homogenous data nearby, improves pre-processing steps which then
     //   improves overall compression.
 
-    // Main assumption: these are likely to be very small integers and fairly similar to eachother
-    //
-    // 3 bit bit length header with concentration around smaller numbers seems good, I don't think 4 bits
-    // is really worth it since then your header is likely largely than the data itself.
+    // Main assumption: these are likely to be small integers and fairly similar to eachother
     //
     // delta encoding?
     // daniel lemire's FastPFOR or similar would be worthwhile if we were expecting larger amounts of integers.
     integers: Vec<i64>,
-    // UTF-8 is fairly compact already, just write that to the buffer if need be.
+    // Assumptions:
+    // - Most strings are probably ascii and english.
+    // - These strings are more likely to contain groups of more uncommon data like numerals or special characters.
     //
-    // null terminating the strings is a bit dangerous, but even if we used the same format as
-    // integers for the string length, then we only save on bits up to 16 bytes in, which seems too close to
-    // a median for probable values.
-    //
-    // If all strings are ascii, then we could compact to 7 bits easily.
-    // 1-32 are also unused which means we are still only using 75% of the values, so this could be compressed
-    // further if we are given a sequence of characters
-    //
-    // Lets try using a single bit header of "all-ascii", then we can encode the common path better.
+    // Encode this as either english frequency based huffman codes or use ultrapacker for even distribution of
+    // probable values.
     strings: Vec<Cow<'a, str>>,
     // booleans can just be bitpacked directly, RLE *may* help sometimes, but given mostly random booleans
     // it'll just bloat this size.

@@ -186,10 +186,19 @@ impl<'a> BitPacker<'a> {
             ultra_packer::write_bundle(self, ASCII_BITS_PER_BUNDLE, bundle);
         }
 
-        // write remainder as 7 bit ascii codes
-        for _ in 0..remainder {
-            let byte = bytes.next().expect("should still have a remainder byte");
-            self.write_bits(byte, 7);
+        // write remainder as smaller bundle
+        if remainder > 0 {
+            let mut remainder_buffer = vec![0u64; remainder];
+            for i in 0..remainder {
+                let byte = bytes.next().expect("should still have a remainder byte");
+                remainder_buffer[i] = compact_ascii(byte) as u64;
+            }
+
+            let remainder_bits =
+                ultra_packer::bits_per_bundle(ASCII_MAX_VALUE as u64, remainder as u8);
+            let remainder_bundle =
+                ultra_packer::encode(remainder as u8, ASCII_MAX_VALUE as u64, &remainder_buffer);
+            ultra_packer::write_bundle(self, remainder_bits, remainder_bundle);
         }
     }
 

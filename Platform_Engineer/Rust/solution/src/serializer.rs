@@ -223,7 +223,8 @@ impl<'a> Serializer<'a> {
         for string in &self.strings {
             if all_ascii {
                 // packer.write_ascii_string(string);
-                packer.write_ascii_string_ultrapacked(string);
+                // packer.write_ascii_string_ultrapacked(string);
+                packer.write_ascii_string_charset(string);
             } else {
                 // need to encode as utf-8 directly
                 packer.write_string(string);

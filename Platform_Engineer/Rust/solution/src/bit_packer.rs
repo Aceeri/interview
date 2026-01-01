@@ -44,90 +44,66 @@ impl<'a> BitPacker<'a> {
         }
     }
 
-    pub fn write_bytes_width(&mut self, bytes: &[u8], width: u8) {
-        assert!(width > 0);
-
-        let total_bytes = (width as usize + 7) / 8;
-        let remaining_bits = width % 8;
-
-        if remaining_bits > 0 {
-            self.write_bits(bytes[total_bytes - 1], remaining_bits);
-            for i in (0..total_bytes - 1).rev() {
-                self.write_byte(bytes[i]);
-            }
-        } else {
-            for i in (0..total_bytes).rev() {
-                self.write_byte(bytes[i]);
-            }
-        }
-    }
-
-    pub fn write_byte(&mut self, byte: u8) {
-        self.write_bytes(&[byte]);
-    }
-
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-
-        // TODO: do we even need the 0 and 8 bit stuff? feels a bit silly
-        if self.bit_offset == 0 {
-            // placeholder byte exists, fill it first
-            let last = self.buffer.len() - 1;
-            self.buffer[last] = bytes[0];
-            self.buffer.extend_from_slice(&bytes[1..]);
-            self.bit_offset = 8;
-        } else if self.bit_offset == 8 {
-            // last byte filled, just extend
-            self.buffer.extend_from_slice(bytes);
-        } else {
-            // disjoint, fill last and next
-            for &byte in bytes {
-                let left_mask = byte >> self.bit_offset;
-                let right_mask = byte << (8 - self.bit_offset);
-                let last = self.buffer.len() - 1;
-                self.buffer[last] |= left_mask;
-                self.buffer.push(right_mask);
-            }
-        }
-    }
-
-    pub fn write_bits(&mut self, bits: u8, width: u8) {
-        assert!(width > 0);
-
+    fn ensure_space(&mut self) {
         if self.bit_offset == 8 {
             self.buffer.push(0);
             self.bit_offset = 0;
-        }
-
-        let bits = bits & (((1u16 << width) - 1) as u8);
-        let remaining = 8 - self.bit_offset;
-        let last = self.buffer.len() - 1;
-
-        if width <= remaining {
-            self.buffer[last] |= bits << (remaining - width);
-            self.bit_offset += width;
-        } else {
-            self.buffer[last] |= bits >> (width - remaining);
-            let second_width = width - remaining;
-            self.buffer.push(bits << (8 - second_width));
-            self.bit_offset = second_width;
         }
     }
 
     pub fn write_bit(&mut self, bit: bool) {
-        if self.bit_offset == 8 {
-            self.buffer.push(0);
-            self.bit_offset = 0;
-        }
-
-        if bit {
-            let last = self.buffer.len() - 1;
-            self.buffer[last] |= 1 << (7 - self.bit_offset);
-        }
-
+        self.ensure_space();
+        let last = self.buffer.len() - 1;
+        self.buffer[last] |= (bit as u8) << (7 - self.bit_offset);
         self.bit_offset += 1;
+    }
+
+    pub fn write_bits(&mut self, bits: u8, width: u8) {
+        self.ensure_space();
+        let bits = bits & ((1u16 << width) - 1) as u8;
+        let space = 8 - self.bit_offset;
+        let last = self.buffer.len() - 1;
+
+        if width <= space {
+            self.buffer[last] |= bits << (space - width);
+            self.bit_offset += width;
+        } else {
+            let overflow = width - space;
+            self.buffer[last] |= bits >> overflow;
+            self.buffer.push(bits << (8 - overflow));
+            self.bit_offset = overflow;
+        }
+    }
+
+    pub fn write_byte(&mut self, byte: u8) {
+        self.ensure_space();
+        let last = self.buffer.len() - 1;
+
+        if self.bit_offset == 0 {
+            self.buffer[last] = byte;
+            self.bit_offset = 8;
+        } else {
+            self.buffer[last] |= byte >> self.bit_offset;
+            self.buffer.push(byte << (8 - self.bit_offset));
+        }
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_byte(byte);
+        }
+    }
+
+    pub fn write_bytes_width(&mut self, bytes: &[u8], width: u8) {
+        let high_bits = width % 8;
+        let full_bytes = (width / 8) as usize;
+
+        if high_bits > 0 {
+            self.write_bits(bytes[full_bytes], high_bits);
+        }
+        for i in (0..full_bytes).rev() {
+            self.write_byte(bytes[i]);
+        }
     }
 
     pub fn write_int(&mut self, int: i64) {
@@ -230,27 +206,28 @@ impl<'a> BitUnpacker<'a> {
         }
     }
 
-    pub fn read_bit(&mut self) -> Option<bool> {
-        let byte = self.buffer.get(self.byte_index)?;
-        let bit = (byte >> (7 - self.bit_offset)) & 1 != 0;
+    fn advance(&mut self) {
         self.bit_offset += 1;
         if self.bit_offset == 8 {
             self.byte_index += 1;
             self.bit_offset = 0;
         }
+    }
+
+    pub fn read_bit(&mut self) -> Option<bool> {
+        let byte = *self.buffer.get(self.byte_index)?;
+        let bit = (byte >> (7 - self.bit_offset)) & 1 != 0;
+        self.advance();
         Some(bit)
     }
 
     pub fn read_bits(&mut self, width: u8) -> Option<u8> {
-        assert!(width > 0);
+        let space = 8 - self.bit_offset;
+        let byte = *self.buffer.get(self.byte_index)?;
+        let mask = ((1u16 << width) - 1) as u8;
 
-        let remaining = 8 - self.bit_offset;
-        let byte = self.buffer.get(self.byte_index)?;
-
-        if width <= remaining {
-            let shift = remaining - width;
-            let mask = ((1u16 << width) - 1) as u8;
-            let result = (byte >> shift) & mask;
+        if width <= space {
+            let result = (byte >> (space - width)) & mask;
             self.bit_offset += width;
             if self.bit_offset == 8 {
                 self.byte_index += 1;
@@ -258,16 +235,26 @@ impl<'a> BitUnpacker<'a> {
             }
             Some(result)
         } else {
-            let first_mask = ((1u16 << remaining) - 1) as u8;
-            let first_part = byte & first_mask;
+            let overflow = width - space;
+            let first = byte & ((1u8 << space) - 1);
             self.byte_index += 1;
+            let second = *self.buffer.get(self.byte_index)? >> (8 - overflow);
+            self.bit_offset = overflow;
+            Some((first << overflow) | second)
+        }
+    }
 
-            let second_width = width - remaining;
-            let second_byte = self.buffer.get(self.byte_index)?;
-            let second_part = second_byte >> (8 - second_width);
+    pub fn read_byte(&mut self) -> Option<u8> {
+        let byte = *self.buffer.get(self.byte_index)?;
 
-            self.bit_offset = second_width;
-            Some((first_part << second_width) | second_part)
+        if self.bit_offset == 0 {
+            self.byte_index += 1;
+            Some(byte)
+        } else {
+            let space = 8 - self.bit_offset;
+            self.byte_index += 1;
+            let next = *self.buffer.get(self.byte_index)?;
+            Some((byte << self.bit_offset) | (next >> space))
         }
     }
 
@@ -279,46 +266,26 @@ impl<'a> BitUnpacker<'a> {
         Some(result)
     }
 
-    pub fn read_byte(&mut self) -> Option<u8> {
-        if self.bit_offset == 0 {
-            let byte = self.buffer.get(self.byte_index)?;
-            self.byte_index += 1;
-            Some(*byte)
-        } else {
-            let remaining = 8 - self.bit_offset;
-            let first_part = self.buffer.get(self.byte_index)? & (((1u16 << remaining) - 1) as u8);
-            self.byte_index += 1;
-            let second_part = self.buffer.get(self.byte_index)? >> remaining;
-            Some((first_part << self.bit_offset) | second_part)
-        }
-    }
-
     pub fn read_bytes_width(&mut self, width: u8) -> Option<u64> {
-        assert!(width > 0);
+        let high_bits = width % 8;
+        let full_bytes = width / 8;
 
-        let total_bytes = (width as usize + 7) / 8;
-        let remaining_bits = width % 8;
-
-        let mut value: u64 = 0;
-        if remaining_bits > 0 {
-            value = self.read_bits(remaining_bits)? as u64;
-            for _ in 0..total_bytes - 1 {
-                value = (value << 8) | (self.read_byte()? as u64);
-            }
+        let mut value: u64 = if high_bits > 0 {
+            self.read_bits(high_bits)? as u64
         } else {
-            for _ in 0..total_bytes {
-                value = (value << 8) | (self.read_byte()? as u64);
-            }
-        }
+            0
+        };
 
+        for _ in 0..full_bytes {
+            value = (value << 8) | (self.read_byte()? as u64);
+        }
         Some(value)
     }
 
     pub fn read_int(&mut self) -> Option<i64> {
         let header = self.read_bits(3)?;
         let width = INT_WIDTHS[header as usize];
-        let value = self.read_bytes_width(width)?;
-        Some(value as i64)
+        Some(self.read_bytes_width(width)? as i64)
     }
 
     pub fn read_ascii_string(&mut self) -> Option<String> {

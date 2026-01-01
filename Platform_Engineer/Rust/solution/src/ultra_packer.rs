@@ -17,17 +17,6 @@ use crate::bit_packer::{BitPacker, BitUnpacker};
 //
 // https://save-buffer.github.io/ultrapack.html
 
-// Hack to get around rust not allowing const (BUNDLE_SIZE, BITS_PER_BUNDLE): (u8, u8) = find_optimal_bundle(..)
-pub const fn find_optimal_bundle_size(max_value: u64) -> u8 {
-    let (bundle_size, _) = find_optimal_bundle(max_value);
-    bundle_size
-}
-
-pub const fn find_optimal_bits_per_bundle(max_value: u64) -> u8 {
-    let (_, bits_per_bundle) = find_optimal_bundle(max_value);
-    bits_per_bundle
-}
-
 pub const fn bits_per_bundle(max_value: u64, bundle_size: u8) -> u8 {
     let max_bundle = max_value.pow(bundle_size as u32);
     (64 - (max_bundle - 1).leading_zeros()) as u8
@@ -62,16 +51,6 @@ pub const fn find_optimal_bundle(max_value: u64) -> (u8, u8) {
     (best_size, bits_per_bundle(max_value, best_size))
 }
 
-/// theoretical minimum bits per value
-pub fn theoretical_bits(max_value: u64) -> f64 {
-    (max_value as f64).log2()
-}
-
-/// traditional bitpacking bits per value
-pub fn naive_bits(max_value: u64) -> u8 {
-    (64 - (max_value - 1).leading_zeros()) as u8
-}
-
 pub fn encode(bundle_size: u8, max_value: u64, values: &[u64]) -> u64 {
     assert_eq!(values.len(), bundle_size as usize);
 
@@ -100,10 +79,5 @@ pub fn write_bundle(packer: &mut BitPacker, bits_per_bundle: u8, bundle: u64) {
 }
 
 pub fn read_bundle(unpacker: &mut BitUnpacker, bits_per_bundle: u8) -> Option<u64> {
-    let mut value: u64 = 0;
-    // TODO: don't read per bit
-    for _ in 0..bits_per_bundle {
-        value = (value << 1) | (unpacker.read_bit()? as u64);
-    }
-    Some(value)
+    unpacker.read_bytes_width(bits_per_bundle)
 }

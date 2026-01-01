@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::VecDeque, marker::PhantomData};
+use std::{borrow::Cow, collections::VecDeque};
 
 use crate::bit_packer::{BitPacker, BitUnpacker};
 
@@ -166,11 +166,10 @@ impl<'a> Serializer<'a> {
     }
 
     // are we ascii & are we above the "control" characters?
-    // if so we can save at least
     pub fn all_32_127(&self) -> bool {
         self.strings
             .iter()
-            .any(|string| string.chars().any(|c| c as u32 >= 32 && c as u32 <= 127))
+            .all(|string| string.chars().all(|c| c as u32 >= 32 && c as u32 <= 127))
     }
 
     pub fn finish_native(&self, buffer: &mut Vec<u8>, version: u8) {
@@ -206,10 +205,11 @@ impl<'a> Serializer<'a> {
         // per type headers
         packer.write_int(self.integers.len() as i64);
         packer.write_int(self.booleans.len() as i64);
+
         let all_ascii = self.all_32_127();
-        // let all_ascii = false;
         packer.write_bit(all_ascii);
         packer.write_int(self.strings.len() as i64);
+
         packer.write_int(self.property_types.len() as i64);
 
         for integer in &self.integers {
@@ -220,14 +220,13 @@ impl<'a> Serializer<'a> {
             packer.write_bit(*boolean);
         }
 
-        for string in &self.strings {
-            if all_ascii {
-                // packer.write_ascii_string(string);
-                // packer.write_ascii_string_ultrapacked(string);
-                packer.write_ascii_string_charset(string);
-            } else {
-                // need to encode as utf-8 directly
-                packer.write_string(string);
+        if all_ascii {
+            for string in &self.strings {
+                packer.write_ascii_string_adaptive(string);
+            }
+        } else {
+            for string in &self.strings {
+                packer.write_unicode_huffman_string(string);
             }
         }
 
@@ -239,7 +238,6 @@ impl<'a> Serializer<'a> {
 
 #[derive(Debug)]
 pub struct Deserializer {
-    // buffers
     integers: VecDeque<i64>,
     strings: VecDeque<String>,
     booleans: VecDeque<bool>,
@@ -256,8 +254,16 @@ impl Deserializer {
         }
     }
 
-    // should ideally a `Result`
+    fn clear(&mut self) {
+        self.integers.clear();
+        self.strings.clear();
+        self.booleans.clear();
+        self.property_types.clear();
+    }
+
+    // ideally a `Result`
     pub fn read_bytes(&mut self, bytes: &[u8], version: u8) -> Option<()> {
+        self.clear();
         let mut unpacker = BitUnpacker::new(bytes);
 
         let read_version = unpacker.read_byte()?;
@@ -281,13 +287,19 @@ impl Deserializer {
 
         if all_ascii {
             for _ in 0..string_len {
-                // self.strings.push_back(unpacker.read_ascii_string()?);
-                self.strings
-                    .push_back(unpacker.read_ascii_string_ultrapacked()?);
+                let is_huffman = unpacker.read_bit()?;
+                if is_huffman {
+                    self.strings
+                        .push_back(unpacker.read_ascii_huffman_string()?);
+                } else {
+                    self.strings
+                        .push_back(unpacker.read_ascii_ultrapacked_string()?);
+                }
             }
         } else {
             for _ in 0..string_len {
-                self.strings.push_back(unpacker.read_string()?);
+                self.strings
+                    .push_back(unpacker.read_unicode_huffman_string()?);
             }
         }
 

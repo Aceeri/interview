@@ -31,7 +31,6 @@ pub const fn find_optimal_bundle(max_value: u64) -> (u8, u8) {
     let mut best_size = 1u8;
     let mut best_bits_per_val = naive_bits as f64;
 
-    // test bundle sizes until we overflow u64
     let mut bundle_size = 1;
     while bundle_size <= 40u8 {
         // max_value^k - 1

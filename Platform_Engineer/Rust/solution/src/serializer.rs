@@ -2,22 +2,10 @@ use std::{borrow::Cow, collections::VecDeque};
 
 use crate::bit_packer::{BitPacker, BitUnpacker};
 
-// Assumptions/requirements about schemas:
-// - Primarily focus on small configs, avoid bloating beyond initial size.
-// - Source of data is verified outside of serializing/deserializing, but invalid properties should still
-//   be caught in case of any form of data corruption.
-// - Version id assignment of schemas is handled by the user/tooling.
-
 #[derive(Debug, Default)]
 pub struct Serializer<'a> {
     // each property is order-dependent, arrays are flattened into this structure and theoretically
     // nested structs would do the same.
-
-    // Keep similar types next to each other for 2 reasons:
-    // - Based on some prior work on vertex compression, grouping data together can get you
-    //   closer to theoretical entropy limits.
-    // - Compressors generally also like homogenous data nearby, improves pre-processing steps which then
-    //   improves overall compression.
 
     // Main assumption: these are likely to be small integers and fairly similar to eachother
     //
@@ -81,6 +69,7 @@ pub enum PropertyValue {
 
 // hacky way to get the compiler to re-use the allocated Vec for differing lifetimes
 // worst case the optimization fails and we end up with the naive allocating solution.
+#[inline]
 fn reuse_vec<T, U>(mut v: Vec<T>) -> Vec<U> {
     const {
         assert!(size_of::<T>() == size_of::<U>());
@@ -100,7 +89,8 @@ impl<'a> Serializer<'a> {
         }
     }
 
-    // should generally hint to the compiler enough that we can re-use this serializer.
+    // should generally hint to the compiler enough that we can re-use this serializer for a
+    // different lifetime.
     pub fn reuse<'b>(mut self) -> Serializer<'b> {
         self.integers.clear();
         self.booleans.clear();
@@ -320,7 +310,6 @@ impl Deserializer {
     }
 
     pub fn take_array(&mut self) -> Option<Vec<PropertyValue>> {
-        // we take advantage of integer compression here, because arrays are likely less than 16 elements.
         let length = self.take_int()? as usize;
 
         let mut values = Vec::with_capacity(length);

@@ -23,6 +23,8 @@ Huffman encoding prioritizes encoding common data more concisely at the expense 
 
 Combining these using a single bit header per string means we get the best of both worlds for minimal cost. Data that is just english phrases will be compressed much better by the huffman encoder, while trickier data from EXIF or program configurations will be compressed better by the ultrapacker.
 
+UTF-8 still works, but is currently uncompressed unless it mixes some ASCII. A global bitflags header of common language charsets is probably worthwhile if data can be any language.
+
 Arrays are encoded as an integer for length and a list of property types. Past that the compression comes from the pre-existing int/bool/str compression. Property types currently fit nicely into 2 bits and utilize all 4 values, though there might be some room there for compression it seems minimal and noisy.
 
 ## Questions
